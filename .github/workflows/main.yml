@@ -1,0 +1,165 @@
+name: Build and Deploy Java Microservice
+
+on:
+  workflow_dispatch:
+    inputs:
+      JDK_VERSION:
+        description: 'Select the JDK version'
+        required: true
+        default: 'JAVA21'
+        type: choice
+        options:
+          - JAVA21
+          - JAVA24
+      environment:
+        description: 'Name of environment'
+        required: true
+        default: 'release'
+      BRANCH:
+        description: 'Branch'
+        required: true
+        default: 'release'
+      API:
+        description: 'API name (repo)'
+        required: true
+      application_name:
+        description: 'Application Name'
+        required: true
+      CPort:
+        description: 'Container Port'
+        required: true
+      NPort:
+        description: 'Node Port'
+        required: true
+      m2_env_folder:
+        description: 'M2 folder for env'
+        required: true
+        default: 'm2_release'
+      namespace:
+        description: 'K8s Namespace'
+        required: true
+        default: 'avizva-hc-microapps'
+      client_name:
+        description: 'Client Name'
+        required: true
+        default: 'avizva-hc'
+      ALERTS_JOB_PATH:
+        description: 'Alerts Job Path'
+        required: true
+        default: 'VizCare-Infra/slack-notifications-alerts/common'
+      app_url:
+        description: 'App URL for health check'
+        required: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout API code
+        uses: actions/checkout@v4
+        with:
+          repository: avizva-products/${{ github.event.inputs.API }}
+          ref: ${{ github.event.inputs.BRANCH }}
+          token: ${{ secrets.BITBUCKET_TOKEN }}
+          path: ${{ github.event.inputs.API }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ github.event.inputs.JDK_VERSION == 'JAVA21' && '21' || '24' }}
+
+      - name: Setup Maven
+        uses: stCarolas/setup-maven@v4
+
+      - name: Maven Build
+        working-directory: ${{ github.event.inputs.API }}
+        run: mvn clean install -U -s ${{ github.event.inputs.m2_env_folder }}/settings.xml
+
+      - name: Generate Dockerfile
+        run: |
+          JDK_VERSION="${{ github.event.inputs.JDK_VERSION }}"
+          APP_NAME="${{ github.event.inputs.application_name }}"
+          CPORT="${{ github.event.inputs.CPort }}"
+          BASE_IMAGE=""
+          if [ "$JDK_VERSION" == "JAVA21" ]; then
+            BASE_IMAGE="eclipse-temurin:21-alpine"
+          elif [ "$JDK_VERSION" == "JAVA24" ]; then
+            BASE_IMAGE="eclipse-temurin:24-alpine"
+          else
+            echo "Unsupported JDK_VERSION"; exit 1
+          fi
+
+          cat <<EOF > Dockerfile
+          FROM $BASE_IMAGE
+          WORKDIR /app
+          COPY target/$APP_NAME.jar $APP_NAME.jar
+          EXPOSE $CPORT
+          CMD ["java","-XX:+UseZGC", "-XX:+ZGenerational", "-jar","$APP_NAME.jar"]
+          EOF
+        working-directory: ${{ github.event.inputs.API }}/${{ github.event.inputs.application_name }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
+          aws-region: ${{ env.AWS_REGION }}
+          # Or use access_key_id, secret_access_key from GitHub secrets
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Docker image
+        run: |
+          IMAGE_NAME="${{ github.event.inputs.application_name }}"
+          ECR_REGISTRY=381491862223.dkr.ecr.us-east-1.amazonaws.com
+          ENV="${{ github.event.inputs.environment }}"
+          docker build -t $IMAGE_NAME .
+          docker tag $IMAGE_NAME:latest $ECR_REGISTRY/$ENV-$IMAGE_NAME:${GITHUB_RUN_NUMBER}
+          docker push $ECR_REGISTRY/$ENV-$IMAGE_NAME:${GITHUB_RUN_NUMBER}
+        working-directory: ${{ github.event.inputs.API }}/${{ github.event.inputs.application_name }}
+
+      - name: Checkout deployment repo
+        uses: actions/checkout@v4
+        with:
+          repository: avizva-products/avizva-infra-common
+          ref: release
+          token: ${{ secrets.BITBUCKET_TOKEN }}
+          path: deployment-repo
+
+      - name: Prepare deployment.yaml
+        run: |
+          cp deployment-repo/terraform-config/Templates/microapp/deployment.yaml .
+          sed -i "s/#{service_name}#/${{ github.event.inputs.application_name }}/g" deployment.yaml
+          sed -i "s/#{container_port}#/${{ github.event.inputs.CPort }}/g" deployment.yaml
+          sed -i "s/#{health_check_url}#/\\/${{ github.event.inputs.application_name }}\\/health-check/g" deployment.yaml
+          # Add other sed commands as needed...
+        working-directory: ${{ github.event.inputs.API }}/${{ github.event.inputs.application_name }}
+
+      - name: Update kubeconfig and deploy
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+        run: |
+          aws eks --region ${{ env.AWS_REGION }} update-kubeconfig --name release-core-product-eks-cluster
+          kubectl apply -f deployment.yaml
+        working-directory: ${{ github.event.inputs.API }}/${{ github.event.inputs.application_name }}
+
+      - name: Wait for deployment (Optional)
+        if: ${{ github.event.inputs.API == 'avizva-hc-brokerex' }}
+        run: |
+          url="https://${{ github.event.inputs.app_url }}"
+          for i in {1..12}; do
+            status=$(curl -sL -w '%{http_code}' "$url" -o /dev/null)
+            if [ "$status" == "200" ]; then
+              echo "App is up!"
+              exit 0
+            fi
+            echo "App not ready yet. Waiting..."
+            sleep 10
+          done
+          echo "Deployment did not become healthy."
+          exit 1
